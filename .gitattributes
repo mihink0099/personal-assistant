@@ -1,0 +1,4 @@
+# Force LF line endings for scripts that run inside Linux containers,
+# regardless of the committer's platform/autocrlf settings - a CRLF
+# run.sh breaks with "bad interpreter" errors in the ha-addon Docker image.
+*.sh text eol=lf

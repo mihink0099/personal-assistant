@@ -7,4 +7,13 @@ tzdata
 faster-whisper     # local, offline speech-to-text (Whisper via CTranslate2)
 piper-tts          # local, offline text-to-speech
 sounddevice        # microphone recording + speaker playback
-numpy              # audio array handling, used directly in voice.py
+numpy              # audio array handling, used directly in voice.py and aec.py
+
+# Optional: real WebRTC AEC3 echo cancellation for barge-in interrupt-watch
+# (see src/personal_assistant/aec.py). NOT installed by default here -
+# prebuilt wheels only cover CPython 3.11-3.13 on Windows as of writing, so
+# this would break `pip install -r requirements.txt` on other interpreters
+# (this project's own Python 3.14 environment included). aec.py falls back
+# automatically to a pure-numpy NLMS filter when this isn't installed -
+# install manually if your interpreter matches:
+#   pip install aec-audio-processing

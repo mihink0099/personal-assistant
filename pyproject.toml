@@ -19,6 +19,14 @@ dependencies = [
     "numpy",
 ]
 
+# Real WebRTC AEC3 echo cancellation for barge-in (see
+# src/personal_assistant/aec.py) - optional because prebuilt wheels only
+# cover CPython 3.11-3.13 on Windows as of writing. aec.py falls back to a
+# pure-numpy NLMS filter automatically when this isn't installed.
+# `pip install -e .[aec]` on a matching interpreter to use it.
+[project.optional-dependencies]
+aec = ["aec-audio-processing"]
+
 [project.scripts]
 personal-assistant = "personal_assistant.assistant:main"
 

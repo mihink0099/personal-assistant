@@ -1,0 +1,82 @@
+# Deliberately NOT built from a Home Assistant base image (those are
+# Alpine/musl-based, and faster-whisper/piper-tts/sounddevice's native
+# dependencies are much easier to get working wheels/builds for on
+# Debian/glibc). This means no `bashio` here - run.sh reads add-on options
+# straight from /data/options.json with jq instead. See DEPLOY.md for the
+# full rationale and the shared-vs-Pi-specific file breakdown.
+ARG BUILD_FROM=python:3.11-slim
+FROM $BUILD_FROM
+
+# - portaudio19-dev / libasound2-dev: PortAudio + ALSA headers, needed to
+#   build `sounddevice` against the container's (passed-through) audio
+#   devices.
+# - ffmpeg: faster-whisper's audio decoding path.
+# - git: pulls the shared personal_assistant package - see below.
+# - jq: run.sh's options.json reader.
+# - curl: handy for manual /health checks from inside the container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        portaudio19-dev \
+        libasound2-dev \
+        ffmpeg \
+        git \
+        jq \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# assistant.py, voice.py, home_assistant.py, aec.py, battery_monitor.py
+# (i.e. everything under src/personal_assistant/) are NOT duplicated into
+# this add-on folder - they're pulled straight from this same GitHub repo
+# at build time, so there is exactly one copy of that code to keep in
+# sync, ever. Updating shared logic later is just "push to main, then hit
+# Rebuild on the add-on in Home Assistant" - see DEPLOY.md.
+ARG PERSONAL_ASSISTANT_REPO=https://github.com/mihink0099/personal-assistant.git
+ARG PERSONAL_ASSISTANT_REF=main
+
+# Cache-busts the git clone below whenever the repo has new commits on
+# PERSONAL_ASSISTANT_REF (this URL's response body changes on every commit)
+# - without this, Docker's layer cache would happily keep reusing a stale
+# clone across "Rebuild"s in the Home Assistant UI, since `git clone` has
+# no other input that changes.
+ADD https://api.github.com/repos/mihink0099/personal-assistant/commits/main /tmp/repo-version.json
+
+# NOT installing the package's optional [aec] extra (aec-audio-processing,
+# real WebRTC AEC3) here: as of writing, that package only ships prebuilt
+# wheels for Windows, and this is a Linux container (source-building
+# WebRTC needs Meson/CMake/SWIG plus a full C++ toolchain, which isn't
+# worth wiring up speculatively for a dependency this narrow). aec.py
+# detects the missing import and falls back to its pure-numpy NLMS filter
+# automatically - same behavior as the dev machine, just for a different
+# reason (no Linux wheel, vs. no Python-3.14 wheel). Check the add-on log
+# for "[AEC] Using ..." to confirm.
+RUN git clone --depth 1 --branch "$PERSONAL_ASSISTANT_REF" "$PERSONAL_ASSISTANT_REPO" /opt/personal-assistant \
+    && pip install --no-cache-dir -e /opt/personal-assistant
+
+WORKDIR /app
+
+# Add-on/Pi-specific files - these DO live in this folder (ha-addon/) in
+# the repo, so a normal Docker COPY (build context = this folder, per Home
+# Assistant's local add-on build convention) picks them up directly.
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# openwakeword needs its own melspectrogram/speech-embedding feature-
+# extraction models (separate from the wake-word-specific model in
+# models/, below) to turn raw audio into the features its classifier
+# reads. Pre-fetch them at build time so wake_word.py never tries to
+# download anything the first time it runs on the Pi.
+RUN python3 -c "import openwakeword.utils; openwakeword.utils.download_models()"
+
+COPY pi_server.py ./pi_server.py
+COPY wake_word.py ./wake_word.py
+COPY run.sh /run.sh
+RUN chmod a+x /run.sh
+
+# Your custom wake-word model(s) - wake_word.py's default path is
+# models/hey_jarvis_custom.onnx, alongside pi_server.py/wake_word.py at
+# /app. Override with the WAKE_WORD_MODEL_PATH add-on option if you keep
+# yours somewhere else in the image (e.g. a different filename here).
+COPY models ./models
+
+EXPOSE 8000
+
+CMD ["/run.sh"]

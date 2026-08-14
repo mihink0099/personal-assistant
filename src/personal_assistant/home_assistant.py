@@ -10,6 +10,7 @@ Docs: https://developers.home-assistant.io/docs/api/rest/
 """
 
 import os
+import re
 import requests
 from dotenv import load_dotenv
 
@@ -121,3 +122,131 @@ def turn_off_light(entity_id: str) -> str:
     if not ok:
         return f"Error turning off '{entity_id}': {data}"
     return f"Turned off {entity_id}."
+
+
+# ---------------------------------------------------------------------------
+# Battery monitor support (see battery_monitor.py)
+# ---------------------------------------------------------------------------
+_BATTERY_DEVICE_CLASS = "battery"
+_CHARGING_DEVICE_CLASS = "battery_charging"
+
+
+def discover_battery_entities() -> tuple[str | None, str | None]:
+    """
+    Auto-discovers the phone's battery-level sensor (a `sensor.*` entity
+    with attributes.device_class == "battery") and, if present, a matching
+    `binary_sensor.*` for charging state (device_class == "battery_charging")
+    on the same device - this is what Home Assistant's mobile app
+    integration typically exposes, and we never want to hardcode an
+    entity_id that could differ per install.
+
+    BATTERY_ENTITY_ID / BATTERY_CHARGING_ENTITY_ID in .env override either
+    half of auto-detection, for when none is found or the wrong one is
+    picked (multiple devices reporting battery, unusual naming, etc.) -
+    whatever this function finds along the way is printed so you know
+    exactly what to paste into .env.
+
+    Returns (battery_entity_id, charging_entity_id). Either may be None:
+    no charging entity isn't fatal to the caller (charging state is just
+    treated as unknown), but no battery entity means there's nothing to
+    monitor at all.
+    """
+    battery_override = os.getenv("BATTERY_ENTITY_ID") or None
+    charging_override = os.getenv("BATTERY_CHARGING_ENTITY_ID") or None
+
+    ok, data = _request("GET", "/states")
+    if not ok:
+        print(f"[battery discovery] Could not list entities: {data}")
+        return battery_override, charging_override
+
+    battery_sensors = []    # [(entity_id, friendly_name), ...]
+    charging_sensors = []
+    for entity in data:
+        entity_id = entity.get("entity_id", "")
+        domain = entity_id.split(".")[0] if "." in entity_id else ""
+        attributes = entity.get("attributes", {})
+        device_class = attributes.get("device_class")
+        friendly_name = attributes.get("friendly_name", entity_id)
+
+        if domain == "sensor" and device_class == _BATTERY_DEVICE_CLASS:
+            battery_sensors.append((entity_id, friendly_name))
+        elif domain == "binary_sensor" and device_class == _CHARGING_DEVICE_CLASS:
+            charging_sensors.append((entity_id, friendly_name))
+
+    battery_entity_id = battery_override
+    if not battery_entity_id:
+        if len(battery_sensors) == 1:
+            battery_entity_id = battery_sensors[0][0]
+        elif not battery_sensors:
+            print("[battery discovery] No battery-level sensor (device_class: battery) found.")
+        else:
+            print(
+                "[battery discovery] Multiple battery sensors found - set "
+                "BATTERY_ENTITY_ID in .env to pick one:"
+            )
+            for entity_id, friendly_name in battery_sensors:
+                print(f"  {entity_id}  ({friendly_name})")
+
+    charging_entity_id = charging_override
+    if not charging_entity_id and battery_entity_id and charging_sensors:
+        # Match by shared device name, e.g. "Pixel 7 Battery" (sensor) and
+        # "Pixel 7 Battery Charging" (binary_sensor) - strip the battery
+        # sensor's friendly name down to the part before "battery" and look
+        # for a charging sensor whose name starts with it.
+        battery_friendly = next(
+            (name for eid, name in battery_sensors if eid == battery_entity_id), ""
+        )
+        device_name = re.sub(r"\s*battery.*$", "", battery_friendly, flags=re.IGNORECASE).strip()
+        matches = [
+            eid for eid, name in charging_sensors
+            if device_name and name.lower().startswith(device_name.lower())
+        ]
+        if len(matches) == 1:
+            charging_entity_id = matches[0]
+        elif len(charging_sensors) == 1:
+            # Only one charging sensor exists at all - reasonable to assume
+            # it belongs to this device even if the naming didn't line up.
+            charging_entity_id = charging_sensors[0][0]
+        else:
+            print(
+                "[battery discovery] Multiple charging sensors found - set "
+                "BATTERY_CHARGING_ENTITY_ID in .env to pick one (optional - "
+                "charging state just won't be considered if left unset):"
+            )
+            for entity_id, friendly_name in charging_sensors:
+                print(f"  {entity_id}  ({friendly_name})")
+
+    return battery_entity_id, charging_entity_id
+
+
+def get_battery_status(
+    battery_entity_id: str, charging_entity_id: str | None
+) -> tuple[float | None, bool | None]:
+    """
+    Reads the current battery percentage and, if a charging entity was
+    found, whether it's currently charging. Returns (level, is_charging) -
+    either may be None if that entity's state is missing or unreadable
+    (e.g. HA briefly reports "unavailable"), which callers should treat as
+    "try again next poll" rather than an error.
+    """
+    ok, data = _request("GET", f"/states/{battery_entity_id}")
+    level = None
+    if ok:
+        try:
+            level = float(data.get("state"))
+        except (TypeError, ValueError):
+            pass
+    else:
+        print(f"[battery discovery] Could not read battery level: {data}")
+
+    is_charging = None
+    if charging_entity_id:
+        ok, data = _request("GET", f"/states/{charging_entity_id}")
+        if ok:
+            state = str(data.get("state", "")).lower()
+            if state in ("on", "off"):
+                is_charging = state == "on"
+        else:
+            print(f"[battery discovery] Could not read charging state: {data}")
+
+    return level, is_charging

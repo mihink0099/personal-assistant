@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
+from . import battery_monitor
 from . import home_assistant as ha
 from . import voice
 
@@ -297,6 +298,11 @@ def main() -> None:
     if not os.getenv("HA_TOKEN"):
         print("HA_TOKEN is not set - check your .env file.")
         return
+
+    # Daemon thread: polls a battery sensor in the background and speaks
+    # unprompted low-battery/fully-charged announcements. Runs for the life
+    # of the process and never blocks it from exiting.
+    battery_monitor.start()
 
     print("Smart home assistant ready.")
     print("Press Enter with nothing typed to talk (push-to-talk), or type a message directly.")

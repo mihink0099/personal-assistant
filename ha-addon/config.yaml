@@ -1,0 +1,46 @@
+name: "Personal Assistant"
+version: "0.1.0"
+slug: "personal_assistant"
+description: "Claude-powered smart home assistant - FastAPI text chat and always-on voice, backed by Home Assistant."
+url: "https://github.com/mihink0099/personal-assistant"
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+ingress: false
+
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: "FastAPI /chat HTTP endpoint (POST /chat, GET /health)"
+
+# Raw ALSA device passthrough - sounddevice/PortAudio (used by voice.py)
+# talks to the mic/speaker directly, not through Home Assistant's own
+# audio API, so it needs the real device nodes, not just `audio: true`.
+# /dev/snd is the common case; if your Pi's mic/speaker show up as
+# something else (check `aplay -l` / `arecord -l` on the Pi), adjust this
+# to match - see DEPLOY.md's troubleshooting section.
+devices:
+  - /dev/snd:/dev/snd:rwm
+
+options:
+  anthropic_api_key: ""
+  ha_url: ""
+  ha_token: ""
+  enable_voice: true
+  # Empty = wake_word.py's own default (models/hey_jarvis_custom.onnx,
+  # baked into the image - see Dockerfile). Only set this if you've added
+  # a differently-named/located model file.
+  wake_word_model_path: ""
+  wake_word_threshold: 0.5
+  debug_wake_word: false
+schema:
+  anthropic_api_key: password
+  ha_url: str?
+  ha_token: password?
+  enable_voice: bool
+  wake_word_model_path: str?
+  wake_word_threshold: float
+  debug_wake_word: bool

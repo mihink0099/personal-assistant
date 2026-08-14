@@ -1,0 +1,9 @@
+# Addon-only dependencies (pi_server.py) - kept separate from the repo
+# root's requirements.txt, which lists personal_assistant's own deps and
+# gets installed independently (see Dockerfile: it pip-installs the
+# personal_assistant package straight from GitHub, pulling that file's
+# dependencies in with it).
+fastapi
+uvicorn[standard]
+python-dotenv
+openwakeword   # wake-word gating for the continuous-listening voice loop - see wake_word.py

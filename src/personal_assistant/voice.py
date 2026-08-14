@@ -16,9 +16,13 @@ Both directions talk to the microphone/speakers via `sounddevice`, which
 plays and records plain numpy float32 arrays.
 """
 
+import concurrent.futures
 import queue
 import re
+import string
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +32,17 @@ from piper import PiperVoice
 from piper.config import SynthesisConfig
 from piper.download_voices import download_voice
 
+from . import aec
+
 # Set to False once voice activity detection is dialed in and you don't
 # need to see mic/threshold/RMS details on every recording anymore.
 DEBUG = True
+
+# Separate from DEBUG - prints raw vs. post-echo-cancellation RMS side by
+# side on every interrupt-watch block. Off by default since it's noisy;
+# turn on specifically while tuning/validating AEC (see aec.py's module
+# docstring for why that requires real speaker hardware, not a headset).
+DEBUG_AEC = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -40,12 +52,16 @@ DEBUG = True
 SAMPLE_RATE = 16_000
 BLOCK_SECONDS = 0.1  # size of each chunk we read from the mic while recording
 
-# Simple energy-based (RMS) voice activity detection - no extra dependency
-# beyond what we already need. It measures a moment of background noise
-# first, then treats anything meaningfully louder than that as speech.
-CALIBRATION_SECONDS = 0.3          # how long to sample ambient noise first
+# Energy-based (RMS) voice activity detection - no extra dependency beyond
+# what we already need. A short burst of ambient noise seeds a starting
+# estimate once, the first time the process records anything; after that
+# the estimate keeps adapting for the rest of the session (see
+# _NoiseFloorEstimator below) instead of resetting to a fresh calibration
+# on every recording.
+CALIBRATION_SECONDS = 0.3          # length of the one-time startup calibration burst
+NOISE_FLOOR_EMA_ALPHA = 0.08       # how fast the adaptive estimate reacts to new silence (0-1, higher = faster)
 SPEECH_RMS_FLOOR = 0.01            # minimum RMS to ever count as speech
-SPEECH_RMS_MULTIPLIER = 3.0        # speech must be this many x louder than ambient noise
+SPEECH_RMS_MULTIPLIER = 3.0        # speech must be this many x louder than the adaptive noise floor
 SILENCE_HOLD_SECONDS = 1.2         # stop this long after speech trails off
 MAX_RECORD_SECONDS = 15.0          # hard cap so a stuck mic can't record forever
 NO_SPEECH_TIMEOUT_SECONDS = 5.0    # give up if nothing is heard at all
@@ -70,30 +86,94 @@ SPEECH_SYNTHESIS_CONFIG = SynthesisConfig(length_scale=0.85)
 # treats mic input as the user talking over it, versus ignoring it.
 # TUNE THESE against your actual headset/room - see notes at the bottom.
 INTERRUPT_WARMUP_SECONDS = 0.25      # ignore the mic for this long after each chunk starts
-INTERRUPT_CONSECUTIVE_BLOCKS = 3     # this many over-threshold blocks in a row (~0.3s) = real interruption
+# Rolling window instead of a strict consecutive-block streak, so a natural
+# micro-pause between words (e.g. "wait... stop") doesn't reset progress
+# toward detecting a real interruption.
+INTERRUPT_WINDOW_BLOCKS = 5          # look at the last this-many blocks (~0.5s)
+INTERRUPT_WINDOW_TRIGGER = 3         # ...and trigger once at least this many are over threshold
 
-# Case-insensitive, checked after stripping trailing punctuation. These
-# cancel outright; anything else transcribed during an interruption is
-# treated as a redirect - the next user turn - instead.
-STOP_PHRASES = {"stop", "shut up", "cancel", "never mind", "quiet", "that's enough"}
+# Checked after normalizing (lowercase, punctuation stripped). Matched
+# either as a whole utterance, or as a keyword inside a short (few-word)
+# utterance - see _is_stop_command(). These cancel outright; anything else
+# transcribed during an interruption is treated as a redirect - the next
+# user turn - instead.
+STOP_PHRASES = {"stop", "shut up", "cancel", "quiet", "enough", "never mind"}
+STOP_PHRASE_MAX_WORDS = 5            # utterances this short or shorter are checked for a contained keyword too
+
+# After a stop command, how long to keep listening for an immediate
+# follow-up ("stop... actually, turn off the lights") before giving up and
+# returning to the idle prompt.
+STOP_GRACE_LISTEN_SECONDS = 3.5
 
 # Model objects are slow to construct (loading weights), so we build each
 # one at most once per process and reuse it across turns.
 _whisper_model: WhisperModel | None = None
 _piper_voice: PiperVoice | None = None
 
+# Guards actual audio *playback* (the sd.play()/sd.wait() calls in speak()
+# and speak_interruptible()) so an unprompted background announcement (see
+# battery_monitor.py) can never start talking over the main loop mid-reply,
+# or vice versa - whichever gets here second just blocks on this lock until
+# the other one's done, then plays normally. Synthesis (Piper, which is
+# CPU-bound) deliberately happens *outside* the lock so it isn't blocked.
+PLAYBACK_LOCK = threading.Lock()
+
+
+class _NoiseFloorEstimator:
+    """
+    Session-persistent, continuously-adapting ambient-noise estimate - an
+    exponential moving average (EMA) of RMS, updated only from blocks
+    confirmed as silence (never from speech - see each call site's
+    `.update()`). This lets the live speech threshold track slow drift in
+    room/mic conditions (an AC turning on, a door closing) across the
+    whole running process, instead of resetting to a fresh from-scratch
+    calibration every time record_until_silence() or speak_interruptible()
+    runs.
+    """
+
+    def __init__(self, alpha: float = NOISE_FLOOR_EMA_ALPHA):
+        self.alpha = alpha
+        self.ema: float | None = None
+
+    def seed(self, initial_value: float) -> None:
+        """One-time startup calibration burst result - a no-op if already seeded."""
+        if self.ema is None:
+            self.ema = initial_value
+
+    def update(self, rms: float) -> None:
+        """Folds one more confirmed-silence RMS reading into the running estimate."""
+        if self.ema is None:
+            self.ema = rms
+        else:
+            self.ema = self.alpha * rms + (1 - self.alpha) * self.ema
+
+    @property
+    def threshold(self) -> float:
+        ema = self.ema if self.ema is not None else 0.0
+        return max(SPEECH_RMS_FLOOR, ema * SPEECH_RMS_MULTIPLIER)
+
+
+# One estimator, shared for the process's lifetime by every recording path
+# (push-to-talk and barge-in interrupt-watch alike) - see _seed_noise_floor()
+# below and each classification site's _noise_floor.update() call.
+_noise_floor = _NoiseFloorEstimator()
+
 
 # ---------------------------------------------------------------------------
 # Recording + voice activity detection
 # ---------------------------------------------------------------------------
-def _calibrate_threshold(audio_queue: queue.Queue, debug_label: str = "") -> float:
+def _seed_noise_floor(audio_queue: queue.Queue, debug_label: str = "") -> None:
     """
-    Samples CALIBRATION_SECONDS of ambient noise from `audio_queue` and
-    returns the RMS threshold above which a block counts as speech.
-    Shared by record_until_silence() (calibrates against room silence
-    before listening) and speak_interruptible() (calibrates once before
-    any chunk plays, so Claude's own voice never pollutes the threshold).
+    Runs once per process, whichever entry point (record_until_silence() or
+    speak_interruptible()) gets there first: samples CALIBRATION_SECONDS of
+    ambient noise to seed _noise_floor's starting EMA value. Every call
+    after that is a no-op - from then on the estimate stays current on its
+    own via _noise_floor.update(), called on every block classified as
+    silence during capture/interrupt-watch.
     """
+    if _noise_floor.ema is not None:
+        return
+
     noise_samples = []
     elapsed = 0.0
     while elapsed < CALIBRATION_SECONDS:
@@ -102,32 +182,42 @@ def _calibrate_threshold(audio_queue: queue.Queue, debug_label: str = "") -> flo
         noise_samples.append(rms)
         elapsed += BLOCK_SECONDS
 
-    noise_floor = max(noise_samples)
-    threshold = max(SPEECH_RMS_FLOOR, noise_floor * SPEECH_RMS_MULTIPLIER)
+    _noise_floor.seed(max(noise_samples))
     if DEBUG:
         label = f":{debug_label}" if debug_label else ""
-        print(f"[debug{label}] noise_floor={noise_floor:.5f}  threshold={threshold:.5f}")
-    return threshold
+        print(
+            f"[debug{label}] seeded adaptive noise floor: ema={_noise_floor.ema:.5f}  "
+            f"threshold={_noise_floor.threshold:.5f}"
+        )
 
 
 def _capture_until_silence(
     audio_queue: queue.Queue,
-    threshold: float,
     initial_blocks: list[np.ndarray] | None = None,
     already_speaking: bool = False,
     debug_label: str = "",
+    no_speech_timeout: float = NO_SPEECH_TIMEOUT_SECONDS,
+    max_record_seconds: float = MAX_RECORD_SECONDS,
 ) -> np.ndarray | None:
     """
     Shared recording loop: reads blocks from `audio_queue` until the
     speaker has gone quiet for SILENCE_HOLD_SECONDS after talking, or
-    MAX_RECORD_SECONDS elapses. Used by record_until_silence() (push-to-
-    talk, starting from silence) and by speak_interruptible() (continuing
-    to record after a barge-in has already been detected mid-playback).
+    max_record_seconds elapses. Used by record_until_silence() (push-to-
+    talk, starting from silence), by speak_interruptible() (continuing to
+    record after a barge-in has already been detected mid-playback), and
+    by its post-stop-command grace-listen window (a shorter
+    no_speech_timeout so it gives up quickly if there's no follow-up).
+
+    Reads the live threshold from the shared _noise_floor estimator on
+    every block (rather than a value fixed at the start of the call), and
+    feeds every block classified as silence back into it via
+    _noise_floor.update() - so a long recording's own trailing-silence
+    blocks keep the estimate current too, not just the startup burst.
 
     If `already_speaking` is True, speech is assumed to have already
     started - skips the "wait for speech to begin" phase and its
-    NO_SPEECH_TIMEOUT_SECONDS give-up, since we already know the user is
-    talking (that's why this was called). `initial_blocks`, if given, are
+    no_speech_timeout give-up, since we already know the user is talking
+    (that's why this was called). `initial_blocks`, if given, are
     prepended so the leading edge of speech that triggered detection
     isn't lost.
 
@@ -148,24 +238,28 @@ def _capture_until_silence(
         block = audio_queue.get()
         recorded_blocks.append(block)
         rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+        threshold = _noise_floor.threshold
         elapsed += BLOCK_SECONDS
         block_count += 1
 
-        if rms > threshold:
+        is_speech = rms > threshold
+        if is_speech:
             speech_detected = True
             silence_run = 0.0
-        elif speech_detected:
-            silence_run += BLOCK_SECONDS
+        else:
+            _noise_floor.update(rms)
+            if speech_detected:
+                silence_run += BLOCK_SECONDS
 
         if DEBUG and block_count % debug_print_every_n_blocks == 0:
-            marker = "SPEECH" if rms > threshold else "silence"
+            marker = "SPEECH" if is_speech else "silence"
             print(f"[debug{label}] rms={rms:.5f}  threshold={threshold:.5f}  ({marker})")
 
         if speech_detected and silence_run >= SILENCE_HOLD_SECONDS:
             break
-        if elapsed >= MAX_RECORD_SECONDS:
+        if elapsed >= max_record_seconds:
             break
-        if not speech_detected and elapsed >= NO_SPEECH_TIMEOUT_SECONDS:
+        if not speech_detected and elapsed >= no_speech_timeout:
             break
 
     if not speech_detected:
@@ -209,8 +303,8 @@ def record_until_silence() -> np.ndarray | None:
         return None
 
     with stream:
-        threshold = _calibrate_threshold(audio_queue, debug_label="ptt")
-        return _capture_until_silence(audio_queue, threshold, debug_label="ptt")
+        _seed_noise_floor(audio_queue, debug_label="ptt")
+        return _capture_until_silence(audio_queue, debug_label="ptt")
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +367,85 @@ def _split_into_sentences(text: str) -> list[str]:
     return [s for s in sentences if s]
 
 
+# Markdown that reads naturally in a chat window but unnaturally verbatim
+# out loud - "asterisk asterisk turn off the lights asterisk asterisk" is
+# not what Piper should say for "**Turn off the lights**". Header/bullet/
+# numbered-list markers are line-anchored (only stripped when they open a
+# line); bold can appear anywhere inline.
+_MARKDOWN_HEADER_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE)
+_MARKDOWN_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+", re.MULTILINE)
+_MARKDOWN_NUMBERED_RE = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.MULTILINE)
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+
+
+def _strip_markdown_for_speech(text: str) -> str:
+    """
+    Removes markdown formatting before it ever reaches Piper: bold markers,
+    header hashes, and bullet/numbered list prefixes. The underlying words
+    are kept (a list item still gets spoken, just without "dash" or "one
+    dot" in front of it); only the formatting characters go.
+    """
+    text = _MARKDOWN_HEADER_RE.sub("", text)
+    text = _MARKDOWN_BULLET_RE.sub("", text)
+    text = _MARKDOWN_NUMBERED_RE.sub("", text)
+    text = _MARKDOWN_BOLD_RE.sub(lambda m: m.group(1) or m.group(2), text)
+    return text
+
+
+# How many sentences speak_interruptible() synthesizes and plays as one
+# clip. Grouping (instead of one sentence per chunk) gives Piper more
+# context to work with, so the result sounds like a phrase instead of a
+# string of separately-clipped sentences - at the cost of interrupt
+# latency now being bounded by roughly this many sentences instead of one.
+SENTENCES_PER_CHUNK = 3
+
+
+def _group_sentences(sentences: list[str], group_size: int = SENTENCES_PER_CHUNK) -> list[str]:
+    """
+    Joins consecutive sentences into group_size-sentence chunks. Avoids
+    leaving a trailing group of just one sentence (which would reintroduce
+    the same choppiness this is meant to fix) by folding it into the
+    previous group instead of playing it alone.
+    """
+    if not sentences:
+        return []
+    if len(sentences) <= group_size:
+        return [" ".join(sentences)]
+
+    groups = [sentences[i:i + group_size] for i in range(0, len(sentences), group_size)]
+    if len(groups) > 1 and len(groups[-1]) == 1:
+        groups[-2].extend(groups.pop())
+
+    return [" ".join(group) for group in groups]
+
+
+_PUNCTUATION_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def _is_stop_command(text: str) -> bool:
+    """
+    True if `text` should cancel playback rather than being treated as a
+    redirect. Matches STOP_PHRASES either as the whole (normalized)
+    utterance, or as a keyword contained in a short utterance - so "please
+    stop" or "okay shut up" cancel too, without a longer, unrelated
+    sentence that happens to contain "stop" (e.g. a question about a bus
+    stop) false-triggering.
+    """
+    normalized = text.strip().lower().translate(_PUNCTUATION_TABLE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    if normalized in STOP_PHRASES:
+        return True
+
+    words = normalized.split()
+    if len(words) <= STOP_PHRASE_MAX_WORDS:
+        return any(phrase in normalized for phrase in STOP_PHRASES)
+
+    return False
+
+
 def ensure_voice_downloaded() -> tuple[Path, Path]:
     """
     Makes sure the Piper voice model and its config file exist locally,
@@ -300,7 +473,7 @@ def _get_piper_voice() -> PiperVoice:
 
 def speak(text: str) -> None:
     """Synthesizes `text` with Piper and plays it through the default output device."""
-    text = text.strip()
+    text = _strip_markdown_for_speech(text.strip()).strip()
     if not text:
         return
 
@@ -311,18 +484,18 @@ def speak(text: str) -> None:
         return
 
     audio = np.concatenate([chunk.audio_float_array for chunk in chunks])
-    try:
-        sd.play(audio, samplerate=chunks[0].sample_rate)
-        sd.wait()
-    except sd.PortAudioError as e:
-        print(f"Could not play audio: {e}")
+    with PLAYBACK_LOCK:
+        try:
+            sd.play(audio, samplerate=chunks[0].sample_rate)
+            sd.wait()
+        except sd.PortAudioError as e:
+            print(f"Could not play audio: {e}")
 
 
 def _play_chunk_watching_for_interrupt(
     audio: np.ndarray,
     sample_rate: int,
     audio_queue: queue.Queue,
-    threshold: float,
 ) -> list[np.ndarray] | None:
     """
     Plays one chunk via non-blocking sd.play() while watching `audio_queue`
@@ -332,10 +505,34 @@ def _play_chunk_watching_for_interrupt(
     estimate would risk cutting the chunk's tail off early on the next
     sd.play() call.
 
+    Reads the live threshold from the shared _noise_floor estimator on
+    every block and feeds every block classified as silence back into it,
+    same as _capture_until_silence - see _NoiseFloorEstimator.
+
+    Runs acoustic echo cancellation (see aec.py) on every mic block before
+    anything else touches it - `audio` (the exact reference signal being
+    sent to the speakers this chunk, resampled to SAMPLE_RATE once up
+    front) is fed to the AEC backend alongside the live mic block, and
+    everything downstream (RMS, threshold comparison, the returned
+    blocks) uses the AEC-cleaned signal, not the raw mic input. The
+    reference slice for a given mic block is looked up by elapsed
+    wall-clock time since sd.play() was called - there's no true
+    sample-accurate loopback sync available here, so this is an
+    approximation (see aec.py's module docstring for the same caveat).
+
     Returns None if the chunk finished playing without interruption, or
     the list of mic blocks captured so far (starting from the first block
     that crossed the threshold) if the user interrupted - sd.stop() has
     already been called by the time this returns.
+
+    An interruption triggers on a rolling window (at least
+    INTERRUPT_WINDOW_TRIGGER of the last INTERRUPT_WINDOW_BLOCKS blocks
+    over threshold) rather than a strict consecutive-block streak, so a
+    natural micro-pause between words doesn't reset progress toward
+    detecting a real interruption. The returned blocks start from the
+    first block of the current speech attempt (i.e. the first block after
+    the window last contained zero speech blocks), not just the ones
+    counted toward the trigger, so the leading word isn't lost.
 
     INTERRUPT_WARMUP_SECONDS at the start of the chunk is ignored, so the
     tail of the *previous* chunk (still settling in the room/mic) doesn't
@@ -350,71 +547,130 @@ def _play_chunk_watching_for_interrupt(
         except queue.Empty:
             break
 
-    try:
-        sd.play(audio, samplerate=sample_rate)
-    except sd.PortAudioError as e:
-        print(f"Could not play audio: {e}")
+    # Resample the reference once, up front, rather than per mic block -
+    # it's the same underlying audio for the whole chunk, just sliced
+    # differently per block below.
+    aec_backend = aec.get_backend()
+    reference_at_mic_rate = aec.resample_reference(audio, sample_rate, SAMPLE_RATE)
+
+    # Held for the whole time this chunk is actually coming out of the
+    # speaker (see PLAYBACK_LOCK) - released via the `with` block on every
+    # return path below, including the early one on a PortAudioError.
+    with PLAYBACK_LOCK:
+        try:
+            sd.play(audio, samplerate=sample_rate)
+        except sd.PortAudioError as e:
+            print(f"Could not play audio: {e}")
+            return None
+
+        output_stream = sd.get_stream()
+        chunk_start = time.monotonic()
+        window: deque[bool] = deque(maxlen=INTERRUPT_WINDOW_BLOCKS)
+        pending_blocks: list[np.ndarray] = []
+
+        while output_stream.active:
+            elapsed = time.monotonic() - chunk_start
+            try:
+                block = audio_queue.get(timeout=BLOCK_SECONDS)
+            except queue.Empty:
+                continue
+
+            if elapsed < INTERRUPT_WARMUP_SECONDS:
+                continue  # still inside the warm-up guard - ignore this block
+
+            # Slice out the reference audio for this same elapsed-time
+            # window (see the docstring's note on why this is elapsed-time
+            # aligned rather than sample-accurate), padding with silence
+            # if the block runs past the end of this chunk's reference.
+            ref_start = int(elapsed * SAMPLE_RATE)
+            ref_end = ref_start + len(block)
+            reference_slice = reference_at_mic_rate[ref_start:ref_end]
+            if len(reference_slice) < len(block):
+                reference_slice = np.concatenate([
+                    reference_slice,
+                    np.zeros(len(block) - len(reference_slice), dtype=np.float32),
+                ])
+
+            cleaned_block = aec_backend.process(block, reference_slice)
+
+            raw_rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+            rms = float(np.sqrt(np.mean(cleaned_block.astype(np.float64) ** 2)))
+            threshold = _noise_floor.threshold
+            is_speech = rms > threshold
+            window.append(is_speech)
+
+            if not is_speech:
+                _noise_floor.update(rms)
+
+            # Keep accumulating through the whole current speech attempt,
+            # not just the blocks that end up counted toward the trigger -
+            # as long as the window has *any* speech in it, we're still
+            # mid-attempt (a lone silent block, e.g. a natural pause,
+            # doesn't reset this). Only a window that's gone fully quiet
+            # clears the buffer. Accumulates the AEC-cleaned block (not
+            # the raw one), since that's what gets transcribed later.
+            if any(window):
+                pending_blocks.append(cleaned_block)
+            else:
+                pending_blocks.clear()
+
+            if DEBUG:
+                marker = "SPEECH" if is_speech else "silence"
+                print(
+                    f"[debug:interrupt-watch] rms={rms:.5f}  threshold={threshold:.5f}  "
+                    f"({marker})  window={sum(window)}/{len(window)}"
+                )
+            if DEBUG_AEC:
+                print(f"[debug:aec] raw_rms={raw_rms:.5f}  post_aec_rms={rms:.5f}  delta={raw_rms - rms:+.5f}")
+
+            if len(window) == INTERRUPT_WINDOW_BLOCKS and sum(window) >= INTERRUPT_WINDOW_TRIGGER:
+                sd.stop()
+                return pending_blocks
+
         return None
 
-    output_stream = sd.get_stream()
-    chunk_start = time.monotonic()
-    consecutive_speech_blocks = 0
-    pending_blocks: list[np.ndarray] = []
 
-    while output_stream.active:
-        elapsed = time.monotonic() - chunk_start
-        try:
-            block = audio_queue.get(timeout=BLOCK_SECONDS)
-        except queue.Empty:
-            continue
-
-        if elapsed < INTERRUPT_WARMUP_SECONDS:
-            continue  # still inside the warm-up guard - ignore this block
-
-        rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
-        if rms > threshold:
-            consecutive_speech_blocks += 1
-            pending_blocks.append(block)
-        else:
-            consecutive_speech_blocks = 0
-            pending_blocks.clear()
-
-        if DEBUG:
-            marker = "SPEECH" if rms > threshold else "silence"
-            print(
-                f"[debug:interrupt-watch] rms={rms:.5f}  threshold={threshold:.5f}  "
-                f"({marker})  streak={consecutive_speech_blocks}"
-            )
-
-        if consecutive_speech_blocks >= INTERRUPT_CONSECUTIVE_BLOCKS:
-            sd.stop()
-            return pending_blocks
-
-    return None
+def _synthesize_group(piper: PiperVoice, text: str) -> tuple[np.ndarray, int] | None:
+    """Synthesizes one playback chunk (a group of sentences) with Piper."""
+    chunks = list(piper.synthesize(text, syn_config=SPEECH_SYNTHESIS_CONFIG))
+    if not chunks:
+        return None
+    audio = np.concatenate([chunk.audio_float_array for chunk in chunks])
+    return audio, chunks[0].sample_rate
 
 
 def speak_interruptible(text: str) -> str | None:
     """
-    Like speak(), but plays `text` sentence-by-sentence and listens in the
-    background for the user to barge in - the way Google Home/Alexa handle
-    interruption. This bounds interrupt latency to roughly one sentence
-    instead of the whole response.
+    Like speak(), but plays `text` in multi-sentence chunks (see
+    SENTENCES_PER_CHUNK) and listens in the background for the user to
+    barge in - the way Google Home/Alexa handle interruption. This bounds
+    interrupt latency to roughly SENTENCES_PER_CHUNK sentences instead of
+    the whole response.
+
+    While one chunk plays, the next chunk's synthesis runs concurrently on
+    a background thread (see _synthesize_group), so it's already to hand
+    the moment playback of the current one ends - no dead-air gap waiting
+    on Piper between chunks.
 
     Returns:
       - None if playback finished with no interruption, OR the user
-        interrupted with a stop-phrase ("stop", "cancel", ...) - either
-        way there's nothing new to send to Claude.
-      - The transcribed text of a non-stop-phrase interruption, so the
-        caller can feed it straight into the next run_turn() exactly as
-        if the user had done normal push-to-talk.
+        interrupted with a stop command ("stop", "cancel", ...) and said
+        nothing further within STOP_GRACE_LISTEN_SECONDS - either way
+        there's nothing new to send to Claude.
+      - The transcribed text of a non-stop-command interruption - or, if
+        a stop command was immediately followed by another utterance
+        within the grace window (e.g. "stop - actually, turn off the
+        lights"), the transcribed text of that follow-up - so the caller
+        can feed it straight into the next run_turn() exactly as if the
+        user had done normal push-to-talk.
     """
-    text = text.strip()
+    text = _strip_markdown_for_speech(text.strip()).strip()
     if not text:
         return None
 
     print(f"Speaking: {text}")
-    sentences = _split_into_sentences(text)
-    if not sentences:
+    groups = _group_sentences(_split_into_sentences(text))
+    if not groups:
         return None
 
     piper = _get_piper_voice()
@@ -438,45 +694,79 @@ def speak_interruptible(text: str) -> str | None:
         speak(text)
         return None
 
-    captured: np.ndarray | None = None
+    result_text: str | None = None
 
-    with input_stream:
-        threshold = _calibrate_threshold(audio_queue, debug_label="barge-in")
+    # Single background worker: synthesizes the *next* chunk while the
+    # current one is playing. Torn down with cancel_futures=True/wait=False
+    # (rather than a `with` block, which would block shutdown on whatever's
+    # mid-synthesis) so an interruption returns immediately instead of
+    # waiting on a synthesis job whose audio we're about to discard anyway.
+    synth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-        for sentence in sentences:
-            chunks = list(piper.synthesize(sentence, syn_config=SPEECH_SYNTHESIS_CONFIG))
-            if not chunks:
-                continue
-            audio = np.concatenate([chunk.audio_float_array for chunk in chunks])
+    try:
+        with input_stream:
+            _seed_noise_floor(audio_queue, debug_label="barge-in")
 
-            triggering_blocks = _play_chunk_watching_for_interrupt(
-                audio, chunks[0].sample_rate, audio_queue, threshold
-            )
+            next_synth = synth_executor.submit(_synthesize_group, piper, groups[0])
 
-            if triggering_blocks is not None:
+            for i, _group_text in enumerate(groups):
+                synthesized = next_synth.result()
+
+                # Kick off the next chunk's synthesis now, before playing
+                # this one, so it overlaps with playback instead of only
+                # starting once this chunk is already done.
+                if i + 1 < len(groups):
+                    next_synth = synth_executor.submit(_synthesize_group, piper, groups[i + 1])
+
+                if synthesized is None:
+                    continue
+                audio, sample_rate = synthesized
+
+                triggering_blocks = _play_chunk_watching_for_interrupt(
+                    audio, sample_rate, audio_queue
+                )
+
+                if triggering_blocks is None:
+                    continue  # this chunk finished without interruption - play the next one
+
                 print("Interrupted - listening...")
                 captured = _capture_until_silence(
                     audio_queue,
-                    threshold,
                     initial_blocks=triggering_blocks,
                     already_speaking=True,
                     debug_label="barge-in",
                 )
-                break  # cancel any remaining sentences
 
-    if captured is None:
-        return None
+                if captured is not None:
+                    print("Transcribing...")
+                    heard_text = transcribe(captured)
+                    if not heard_text:
+                        print("Didn't catch that.")
+                    elif not _is_stop_command(heard_text):
+                        print(f"Heard: {heard_text}")
+                        result_text = heard_text
+                    else:
+                        print(f"Heard: {heard_text}")
+                        print("Stopped.")
+                        # Grace window: an immediate follow-up ("stop -
+                        # actually turn off the lights") becomes the next
+                        # turn instead of silently dropping back to the
+                        # idle prompt.
+                        follow_up = _capture_until_silence(
+                            audio_queue,
+                            already_speaking=False,
+                            debug_label="barge-in-grace",
+                            no_speech_timeout=STOP_GRACE_LISTEN_SECONDS,
+                        )
+                        if follow_up is not None:
+                            print("Transcribing...")
+                            follow_up_text = transcribe(follow_up)
+                            if follow_up_text:
+                                print(f"Heard: {follow_up_text}")
+                                result_text = follow_up_text
 
-    print("Transcribing...")
-    heard_text = transcribe(captured)
-    if not heard_text:
-        print("Didn't catch that.")
-        return None
+                break  # cancel any remaining chunks regardless of outcome
+    finally:
+        synth_executor.shutdown(wait=False, cancel_futures=True)
 
-    print(f"Heard: {heard_text}")
-
-    if heard_text.strip().lower().rstrip(".!?,") in STOP_PHRASES:
-        print("Stopped.")
-        return None
-
-    return heard_text
+    return result_text
