@@ -1,0 +1,19 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Piper TTS voice model files (downloaded on first use by voice.py -
+# see ensure_voice_downloaded()). Not source, ~60MB per voice, don't commit.
+voices/
+
+# Local diagnostic output (see scripts/diagnose_ha.py)
+ha_diagnostic_log.txt

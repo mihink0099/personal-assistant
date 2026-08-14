@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-assistant"
+version = "0.1.0"
+description = "A Claude-powered personal assistant with voice I/O and Home Assistant smart home control."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "requests",
+    "python-dotenv",
+    "tzdata",
+    "faster-whisper",
+    "piper-tts",
+    "sounddevice",
+    "numpy",
+]
+
+[project.scripts]
+personal-assistant = "personal_assistant.assistant:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

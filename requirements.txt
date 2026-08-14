@@ -1,0 +1,10 @@
+anthropic
+requests
+python-dotenv
+tzdata
+
+# Voice input/output (see src/personal_assistant/voice.py)
+faster-whisper     # local, offline speech-to-text (Whisper via CTranslate2)
+piper-tts          # local, offline text-to-speech
+sounddevice        # microphone recording + speaker playback
+numpy              # audio array handling, used directly in voice.py
