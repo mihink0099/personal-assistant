@@ -45,6 +45,13 @@ DEBUG_WAKE_WORD = os.getenv("DEBUG_WAKE_WORD", "false").strip().lower() in ("1",
 
 
 def _load_model() -> Model:
+    # Temporary, unconditional (not gated behind DEBUG_WAKE_WORD) - need
+    # this on the add-on's next restart regardless of that setting, to see
+    # what audio devices are actually visible inside the container.
+    print("[wake_word] Audio devices visible to sounddevice:")
+    print(sd.query_devices())
+    print(f"[wake_word] sounddevice.default.device = {sd.default.device}")
+
     if not MODEL_PATH.exists():
         raise SystemExit(
             f"Wake word model not found at '{MODEL_PATH}'. Set WAKE_WORD_MODEL_PATH "
