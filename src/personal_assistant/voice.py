@@ -408,6 +408,51 @@ def _strip_markdown_for_speech(text: str) -> str:
     return text
 
 
+# Symbols Piper otherwise reads literally ("dollar sign", "asterisk",
+# "percent sign") instead of the way a person would actually say them
+# out loud. Currency and percent are matched before the leftover-symbol
+# cleanup below so "$12.50" becomes "12 dollars and 50 cents", not
+# "dollar sign 12.50".
+_CURRENCY_RE = re.compile(r"\$\s?(\d[\d,]*)(?:\.(\d{1,2}))?")
+_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s?%")
+
+
+def _pluralize(n: int, singular: str, plural: str) -> str:
+    return singular if n == 1 else plural
+
+
+def _currency_to_words(match: re.Match) -> str:
+    dollars = int(match.group(1).replace(",", ""))
+    cents_group = match.group(2)
+    cents = int(cents_group.ljust(2, "0")) if cents_group else 0
+
+    dollars_part = f"{dollars} {_pluralize(dollars, 'dollar', 'dollars')}"
+    cents_part = f"{cents} {_pluralize(cents, 'cent', 'cents')}"
+
+    if cents == 0:
+        return dollars_part
+    if dollars == 0:
+        return cents_part
+    return f"{dollars_part} and {cents_part}"
+
+
+def _normalize_symbols_for_speech(text: str) -> str:
+    """
+    Rewrites symbols that Piper would otherwise spell out letter-by-letter
+    ("$500" -> "dollar sign 500") into how they're actually spoken
+    ("500 dollars"). Run after _strip_markdown_for_speech, which already
+    removes **bold**/#headers/-bullets - this only handles what's left.
+    """
+    text = _CURRENCY_RE.sub(_currency_to_words, text)
+    text = _PERCENT_RE.sub(lambda m: f"{m.group(1)} percent", text)
+    text = re.sub(r"#(\d+)", r"number \1", text)
+    text = re.sub(r"\s*&\s*", " and ", text)
+    text = text.replace("@", " at ")
+    text = text.replace("*", "").replace("#", "")
+    text = re.sub(r" {2,}", " ", text)
+    return text
+
+
 # How many sentences speak_interruptible() synthesizes and plays as one
 # clip. Grouping (instead of one sentence per chunk) gives Piper more
 # context to work with, so the result sounds like a phrase instead of a
@@ -489,7 +534,7 @@ def _get_piper_voice() -> PiperVoice:
 
 def speak(text: str) -> None:
     """Synthesizes `text` with Piper and plays it through the default output device."""
-    text = _strip_markdown_for_speech(text.strip()).strip()
+    text = _normalize_symbols_for_speech(_strip_markdown_for_speech(text.strip())).strip()
     if not text:
         return
 
@@ -680,7 +725,7 @@ def speak_interruptible(text: str) -> str | None:
         can feed it straight into the next run_turn() exactly as if the
         user had done normal push-to-talk.
     """
-    text = _strip_markdown_for_speech(text.strip()).strip()
+    text = _normalize_symbols_for_speech(_strip_markdown_for_speech(text.strip())).strip()
     if not text:
         return None
 
