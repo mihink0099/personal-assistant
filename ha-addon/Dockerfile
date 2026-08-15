@@ -7,6 +7,15 @@
 ARG BUILD_FROM=python:3.11-slim
 FROM $BUILD_FROM
 
+# Docker's stdout isn't a terminal, so Python fully buffers print() output
+# by default - it can sit invisible in the buffer indefinitely for a
+# long-running process like this one instead of showing up in `docker logs`
+# / the add-on's Log tab. uvicorn's own logging flushes explicitly (so the
+# startup banner always appears), which made this easy to miss: the voice
+# loop's prints (including its own error messages) were silently getting
+# stuck in the buffer while everything looked fine.
+ENV PYTHONUNBUFFERED=1
+
 # - portaudio19-dev / libasound2-dev: PortAudio + ALSA headers, needed to
 #   build `sounddevice` against the container's (passed-through) audio
 #   devices.
