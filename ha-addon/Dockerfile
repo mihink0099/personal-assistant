@@ -1,3 +1,13 @@
+# syntax=docker/dockerfile:1
+# The line above opts into BuildKit's extended Dockerfile syntax - needed
+# for the --mount=type=cache flags below, which persist pip's build cache
+# across "Rebuild"s on the Pi even when the RUN layer itself is
+# invalidated by a src/ change. Without it, pip re-downloads and
+# recompiles every dependency (numpy, faster-whisper, piper-tts,
+# sounddevice - most of the build's time) completely from scratch on
+# every single rebuild, even ones where none of those dependencies
+# actually changed.
+#
 # Deliberately NOT built from a Home Assistant base image (those are
 # Alpine/musl-based, and faster-whisper/piper-tts/sounddevice's native
 # dependencies are much easier to get working wheels/builds for on
@@ -64,8 +74,9 @@ ADD https://api.github.com/repos/mihink0099/personal-assistant/commits?sha=$PERS
 # automatically - same behavior as the dev machine, just for a different
 # reason (no Linux wheel, vs. no Python-3.14 wheel). Check the add-on log
 # for "[AEC] Using ..." to confirm.
-RUN git clone --depth 1 --branch "$PERSONAL_ASSISTANT_REF" "$PERSONAL_ASSISTANT_REPO" /opt/personal-assistant \
-    && pip install --no-cache-dir -e /opt/personal-assistant
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --depth 1 --branch "$PERSONAL_ASSISTANT_REF" "$PERSONAL_ASSISTANT_REPO" /opt/personal-assistant \
+    && pip install -e /opt/personal-assistant
 
 WORKDIR /app
 
@@ -73,7 +84,7 @@ WORKDIR /app
 # the repo, so a normal Docker COPY (build context = this folder, per Home
 # Assistant's local add-on build convention) picks them up directly.
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
 
 # openwakeword needs its own melspectrogram/speech-embedding feature-
 # extraction models (separate from the wake-word-specific model in
