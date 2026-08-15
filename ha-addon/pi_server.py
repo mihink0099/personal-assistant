@@ -37,6 +37,7 @@ import os
 import queue
 import threading
 import time
+import traceback
 
 from dotenv import load_dotenv
 
@@ -180,8 +181,9 @@ def voice_loop() -> None:
             # actual wake word mid-reply is exceedingly unlikely.
             try:
                 wake_word.wait_for_wake_word()
-            except Exception as e:
-                print(f"[pi_server] Wake-word listening failed: {e}")
+            except Exception:
+                print("[pi_server] Wake-word listening failed:")
+                traceback.print_exc()
                 time.sleep(1)
                 continue
 
@@ -203,8 +205,9 @@ def voice_loop() -> None:
                         print(f"[pi_server] Turn failed: {e}")
 
             time.sleep(0.05)
-    except (SystemExit, Exception) as e:
-        print(f"[pi_server] Voice loop failed to start: {e}")
+    except (SystemExit, Exception):
+        print("[pi_server] Voice loop failed to start:")
+        traceback.print_exc()
 
 
 @app.post("/chat", response_model=ChatResponse)

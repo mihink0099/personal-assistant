@@ -94,6 +94,11 @@ def wait_for_wake_word() -> None:
     def callback(indata, frames, time_info, status):
         audio_queue.put(indata.copy())
 
+    # Temporary, unconditional - confirms what INPUT_DEVICE_INDEX actually
+    # resolves to right at the moment the stream is opened, in case it
+    # ever diverges from the value resolved once at import time.
+    print(f"[wake_word] Opening InputStream on device {INPUT_DEVICE_INDEX}: {sd.query_devices(INPUT_DEVICE_INDEX)}")
+
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
