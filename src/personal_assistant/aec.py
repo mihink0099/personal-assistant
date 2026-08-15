@@ -54,7 +54,20 @@ SAMPLE_RATE = 16_000  # must match voice.SAMPLE_RATE - the rate AEC operates at
 # real echo path to test against and the fallback isn't converging.
 NLMS_FILTER_TAPS = 256        # adaptive filter length in samples (~16ms of echo-path coverage at SAMPLE_RATE)
 NLMS_STEP_SIZE = 0.5          # mu: adaptation rate - higher converges faster but is noisier/less stable
-NLMS_REGULARIZATION = 1e-6    # eps: avoids a divide-by-zero when the reference is near-silent
+# eps: NOT just a divide-by-zero guard - it's the floor on the normalization
+# term (norm = dot(history, history) + eps), which caps the effective
+# per-sample gain at mu/eps. With float32 audio in roughly [-1, 1] and
+# reference blocks that are frequently quiet or briefly silent (between
+# words, start of a chunk), dot(history, history) collapses toward zero
+# often. At 1e-6 that made mu/norm spike to ~500,000 during those moments,
+# so a tiny error*history term produced a massive weight update and the
+# filter's weights diverged (measured: post-AEC RMS up to ~100x the raw
+# mic RMS - amplifying, not cancelling). 1e-2 caps the worst-case gain at
+# mu/eps = 50, low enough to stay stable while quiet, still small enough
+# not to meaningfully dampen adaptation once real reference energy is
+# present (typical quiet-speech-level dot(history, history) over 256 taps
+# is already on this order of magnitude).
+NLMS_REGULARIZATION = 1e-2
 
 # WebRTC backend tuning - a rough estimate of the mic/speaker round-trip
 # delay in milliseconds (buffering + acoustic travel time). TUNE THIS

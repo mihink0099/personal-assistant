@@ -421,6 +421,16 @@ def _strip_markdown_for_speech(text: str) -> str:
 _CURRENCY_RE = re.compile(r"\$\s?(\d[\d,]*)(?:\.(\d{1,2}))?")
 _PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s?%")
 
+# Weather/measurement units that come up constantly in assistant replies
+# (temperature, wind/speed) but that Piper reads as literal symbols/letters
+# rather than words - "18°C" as "eighteen degrees C", "20 km/h" as "twenty
+# k m slash h". Matched case-insensitively since Claude's output casing
+# isn't guaranteed consistent.
+_TEMPERATURE_RE = re.compile(r"°\s?([CF])\b", re.IGNORECASE)
+_SPEED_UNIT_RE = re.compile(r"\b(km/h|kph|mph)\b", re.IGNORECASE)
+_TEMPERATURE_WORDS = {"c": " degrees Celsius", "f": " degrees Fahrenheit"}
+_SPEED_WORDS = {"km/h": "kilometers per hour", "kph": "kilometers per hour", "mph": "miles per hour"}
+
 
 def _pluralize(n: int, singular: str, plural: str) -> str:
     return singular if n == 1 else plural
@@ -450,10 +460,16 @@ def _normalize_symbols_for_speech(text: str) -> str:
     """
     text = _CURRENCY_RE.sub(_currency_to_words, text)
     text = _PERCENT_RE.sub(lambda m: f"{m.group(1)} percent", text)
+    text = _TEMPERATURE_RE.sub(lambda m: _TEMPERATURE_WORDS[m.group(1).lower()], text)
+    text = _SPEED_UNIT_RE.sub(lambda m: _SPEED_WORDS[m.group(1).lower()], text)
     text = re.sub(r"#(\d+)", r"number \1", text)
     text = re.sub(r"\s*&\s*", " and ", text)
     text = text.replace("@", " at ")
     text = text.replace("*", "").replace("#", "")
+    # Leftover bare degree sign (no C/F immediately after, e.g. "180°
+    # angle") - the temperature-specific case above already consumed the
+    # common "°C"/"°F" pattern, so anything left here isn't a duplicate.
+    text = text.replace("°", " degrees ")
     text = re.sub(r" {2,}", " ", text)
     return text
 
