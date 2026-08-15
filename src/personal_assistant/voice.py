@@ -32,7 +32,7 @@ from piper import PiperVoice
 from piper.config import SynthesisConfig
 from piper.download_voices import download_voice
 
-from . import aec
+from . import aec, audio_devices
 
 # Set to False once voice activity detection is dialed in and you don't
 # need to see mic/threshold/RMS details on every recording anymore.
@@ -109,6 +109,21 @@ STOP_GRACE_LISTEN_SECONDS = 3.5
 # one at most once per process and reuse it across turns.
 _whisper_model: WhisperModel | None = None
 _piper_voice: PiperVoice | None = None
+
+# Resolved once per process, then reused - see audio_devices.py for why we
+# can't rely on sounddevice's OS default input device.
+_input_device_index: int | None = None
+
+
+def _get_input_device_index() -> int:
+    global _input_device_index
+    if _input_device_index is None:
+        _input_device_index = audio_devices.resolve_input_device()
+        print(
+            f"[voice] Resolved input device index {_input_device_index}: "
+            f"{sd.query_devices(_input_device_index)['name']}"
+        )
+    return _input_device_index
 
 # Guards actual audio *playback* (the sd.play()/sd.wait() calls in speak()
 # and speak_interruptible()) so an unprompted background announcement (see
@@ -296,9 +311,10 @@ def record_until_silence() -> np.ndarray | None:
             channels=1,
             dtype="float32",
             blocksize=block_samples,
+            device=_get_input_device_index(),
             callback=callback,
         )
-    except sd.PortAudioError as e:
+    except (sd.PortAudioError, RuntimeError) as e:
         print(f"Could not open the microphone: {e}")
         return None
 
@@ -686,9 +702,10 @@ def speak_interruptible(text: str) -> str | None:
             channels=1,
             dtype="float32",
             blocksize=block_samples,
+            device=_get_input_device_index(),
             callback=callback,
         )
-    except sd.PortAudioError as e:
+    except (sd.PortAudioError, RuntimeError) as e:
         print(f"Could not open microphone for interrupt detection: {e}")
         # No mic available for barge-in - just speak the whole thing normally.
         speak(text)

@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 from openwakeword.model import Model
+from personal_assistant import audio_devices
 
 SAMPLE_RATE = 16_000
 CHUNK_SAMPLES = 1280  # 80ms at 16kHz - openwakeword's own recommended frame size
@@ -44,14 +45,21 @@ WAKE_WORD_THRESHOLD = float(os.getenv("WAKE_WORD_THRESHOLD", "0.5"))
 DEBUG_WAKE_WORD = os.getenv("DEBUG_WAKE_WORD", "false").strip().lower() in ("1", "true", "yes")
 
 
-def _load_model() -> Model:
-    # Temporary, unconditional (not gated behind DEBUG_WAKE_WORD) - need
-    # this on the add-on's next restart regardless of that setting, to see
-    # what audio devices are actually visible inside the container.
+def _resolve_input_device() -> int:
+    # Temporary, unconditional (not gated behind DEBUG_WAKE_WORD) - list
+    # every device sounddevice sees before resolving one by name, so if
+    # resolution below fails, the error and the full device list land
+    # together in the log.
     print("[wake_word] Audio devices visible to sounddevice:")
     print(sd.query_devices())
     print(f"[wake_word] sounddevice.default.device = {sd.default.device}")
 
+    index = audio_devices.resolve_input_device()
+    print(f"[wake_word] Resolved input device index {index}: {sd.query_devices(index)['name']}")
+    return index
+
+
+def _load_model() -> Model:
     if not MODEL_PATH.exists():
         raise SystemExit(
             f"Wake word model not found at '{MODEL_PATH}'. Set WAKE_WORD_MODEL_PATH "
@@ -66,6 +74,7 @@ def _load_model() -> Model:
     return Model(wakeword_models=[str(MODEL_PATH)], inference_framework="onnx")
 
 
+INPUT_DEVICE_INDEX = _resolve_input_device()
 _model = _load_model()
 
 
@@ -90,6 +99,7 @@ def wait_for_wake_word() -> None:
         channels=1,
         dtype="int16",
         blocksize=CHUNK_SAMPLES,
+        device=INPUT_DEVICE_INDEX,
         callback=callback,
     ):
         while True:
