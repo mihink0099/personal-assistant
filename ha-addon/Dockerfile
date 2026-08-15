@@ -41,12 +41,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG PERSONAL_ASSISTANT_REPO=https://github.com/mihink0099/personal-assistant.git
 ARG PERSONAL_ASSISTANT_REF=main
 
-# Cache-busts the git clone below whenever the repo has new commits on
-# PERSONAL_ASSISTANT_REF (this URL's response body changes on every commit)
-# - without this, Docker's layer cache would happily keep reusing a stale
-# clone across "Rebuild"s in the Home Assistant UI, since `git clone` has
-# no other input that changes.
-ADD https://api.github.com/repos/mihink0099/personal-assistant/commits/main /tmp/repo-version.json
+# Cache-busts the git clone below whenever the repo has new commits that
+# actually touch what gets installed here - without this, Docker's layer
+# cache would happily keep reusing a stale clone across "Rebuild"s in the
+# Home Assistant UI, since `git clone` has no other input that changes.
+# Scoped to src/, pyproject.toml, and requirements.txt specifically
+# (instead of the whole repo's commit history) so a push that only
+# touches ha-addon/ files - which are just COPY'd in below, not cloned -
+# doesn't force a full from-scratch re-clone and re-install of
+# faster-whisper/piper-tts/sounddevice/numpy, most of which have to
+# compile from source on aarch64 and take the bulk of the build time.
+ADD https://api.github.com/repos/mihink0099/personal-assistant/commits?sha=$PERSONAL_ASSISTANT_REF&path=src&per_page=1 /tmp/repo-version-src.json
+ADD https://api.github.com/repos/mihink0099/personal-assistant/commits?sha=$PERSONAL_ASSISTANT_REF&path=pyproject.toml&per_page=1 /tmp/repo-version-pyproject.json
+ADD https://api.github.com/repos/mihink0099/personal-assistant/commits?sha=$PERSONAL_ASSISTANT_REF&path=requirements.txt&per_page=1 /tmp/repo-version-requirements.json
 
 # NOT installing the package's optional [aec] extra (aec-audio-processing,
 # real WebRTC AEC3) here: as of writing, that package only ships prebuilt
