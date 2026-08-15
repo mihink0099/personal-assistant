@@ -21,11 +21,17 @@ ports_description:
 # audio API, so it needs the real device nodes, not just `audio: true`.
 # /dev/snd is the common case; if your Pi's mic/speaker show up as
 # something else (check `aplay -l` / `arecord -l` on the Pi), adjust this
-# to match - see DEPLOY.md's troubleshooting section. Plain path only
-# (no host:container:permissions triplet) - Supervisor deprecated the old
-# three-part format in favor of just the device path.
+# to match - see DEPLOY.md's troubleshooting section.
+#
+# Deliberately back on the deprecated host:container:permissions triplet
+# form (Supervisor warns to use a bare path instead) - switching to the
+# bare-path form here correlated with sounddevice suddenly seeing zero
+# audio devices at all inside the container (previously it saw at least
+# something, just not resolved correctly). Reverted until the bare-path
+# form's actual behavior is confirmed; the deprecation warning is cosmetic,
+# a silently-broken mic is not.
 devices:
-  - /dev/snd
+  - /dev/snd:/dev/snd:rwm
 
 options:
   anthropic_api_key: ""
