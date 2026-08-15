@@ -111,8 +111,9 @@ _whisper_model: WhisperModel | None = None
 _piper_voice: PiperVoice | None = None
 
 # Resolved once per process, then reused - see audio_devices.py for why we
-# can't rely on sounddevice's OS default input device.
+# can't rely on sounddevice's OS default input/output device.
 _input_device_index: int | None = None
+_output_device_index: int | None = None
 
 
 def _get_input_device_index() -> int:
@@ -124,6 +125,17 @@ def _get_input_device_index() -> int:
             f"{sd.query_devices(_input_device_index)['name']}"
         )
     return _input_device_index
+
+
+def _get_output_device_index() -> int:
+    global _output_device_index
+    if _output_device_index is None:
+        _output_device_index = audio_devices.resolve_output_device()
+        print(
+            f"[voice] Resolved output device index {_output_device_index}: "
+            f"{sd.query_devices(_output_device_index)['name']}"
+        )
+    return _output_device_index
 
 # Guards actual audio *playback* (the sd.play()/sd.wait() calls in speak()
 # and speak_interruptible()) so an unprompted background announcement (see
@@ -292,13 +304,6 @@ def record_until_silence() -> np.ndarray | None:
     speech was detected at all within NO_SPEECH_TIMEOUT_SECONDS (so the
     caller can fall back to typed input).
     """
-    if DEBUG:
-        try:
-            input_device_index = sd.default.device[0]
-            print(f"[debug] default input device: {sd.query_devices(input_device_index)}")
-        except Exception as e:
-            print(f"[debug] could not query default input device: {e}")
-
     block_samples = int(BLOCK_SECONDS * SAMPLE_RATE)
     audio_queue: queue.Queue = queue.Queue()
 
@@ -547,9 +552,9 @@ def speak(text: str) -> None:
     audio = np.concatenate([chunk.audio_float_array for chunk in chunks])
     with PLAYBACK_LOCK:
         try:
-            sd.play(audio, samplerate=chunks[0].sample_rate)
+            sd.play(audio, samplerate=chunks[0].sample_rate, device=_get_output_device_index())
             sd.wait()
-        except sd.PortAudioError as e:
+        except (sd.PortAudioError, RuntimeError) as e:
             print(f"Could not play audio: {e}")
 
 
@@ -619,8 +624,8 @@ def _play_chunk_watching_for_interrupt(
     # return path below, including the early one on a PortAudioError.
     with PLAYBACK_LOCK:
         try:
-            sd.play(audio, samplerate=sample_rate)
-        except sd.PortAudioError as e:
+            sd.play(audio, samplerate=sample_rate, device=_get_output_device_index())
+        except (sd.PortAudioError, RuntimeError) as e:
             print(f"Could not play audio: {e}")
             return None
 
