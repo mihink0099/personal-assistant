@@ -21,9 +21,11 @@ ports_description:
 # audio API, so it needs the real device nodes, not just `audio: true`.
 # /dev/snd is the common case; if your Pi's mic/speaker show up as
 # something else (check `aplay -l` / `arecord -l` on the Pi), adjust this
-# to match - see DEPLOY.md's troubleshooting section.
+# to match - see DEPLOY.md's troubleshooting section. Plain path only
+# (no host:container:permissions triplet) - Supervisor deprecated the old
+# three-part format in favor of just the device path.
 devices:
-  - /dev/snd:/dev/snd:rwm
+  - /dev/snd
 
 options:
   anthropic_api_key: ""
