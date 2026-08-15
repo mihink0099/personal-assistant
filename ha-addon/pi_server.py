@@ -140,60 +140,71 @@ def voice_loop() -> None:
     openwakeword or require a wake word model file to be present at all -
     see wake_word.py's own note about failing loudly rather than silently
     falling back to a different built-in model when one IS expected.
+
+    The import (and everything below it) is wrapped in a try/except that
+    catches SystemExit explicitly, alongside Exception: wake_word.py's
+    _load_model() raises SystemExit if the model file or audio device
+    isn't found, and Python's default behavior silently swallows
+    SystemExit raised inside a daemon thread - no traceback, no message,
+    the thread just quietly dies while the rest of the add-on looks fine.
+    Catching it here means a startup failure is always visible in the log.
     """
-    import wake_word
+    try:
+        import wake_word
 
-    print("[pi_server] Continuous voice listening started (wake-word gated).")
-    while True:
-        try:
-            follow_up = pending_voice_turns.get_nowait()
-        except queue.Empty:
-            follow_up = None
-
-        if follow_up is not None:
-            # A barge-in follow-up from a previous turn - the user already
-            # said this without a fresh wake word (same as the CLI's
-            # barge-in behavior), so skip straight to processing it
-            # instead of waiting to hear the wake word again.
-            _process_voice_turn(follow_up)
-            time.sleep(0.05)
-            continue
-
-        # Idle state: wait for the wake word. Deliberately NOT holding
-        # conversation_lock here, unlike the command-capture step below -
-        # this can block indefinitely (minutes or hours between wake
-        # words), and holding a shared lock for an unbounded wait would
-        # starve /chat almost permanently. wait_for_wake_word() doesn't
-        # touch shared state or play any audio, so the only real cost of
-        # not locking it is a narrow, low-probability window where it's
-        # also listening while a /chat-triggered reply is being spoken
-        # elsewhere - accepted, since the assistant's own voice saying the
-        # actual wake word mid-reply is exceedingly unlikely.
-        try:
-            wake_word.wait_for_wake_word()
-        except Exception as e:
-            print(f"[pi_server] Wake-word listening failed: {e}")
-            time.sleep(1)
-            continue
-
-        # From here through the end of the turn, hold conversation_lock -
-        # same "has the mic/speaker = has the lock" reasoning as /chat,
-        # now scoped to just the active-turn window rather than the whole
-        # (now-unbounded) loop iteration.
-        with conversation_lock:
+        print("[pi_server] Continuous voice listening started (wake-word gated).")
+        while True:
             try:
-                user_text = voice.listen_for_speech()
+                follow_up = pending_voice_turns.get_nowait()
+            except queue.Empty:
+                follow_up = None
+
+            if follow_up is not None:
+                # A barge-in follow-up from a previous turn - the user already
+                # said this without a fresh wake word (same as the CLI's
+                # barge-in behavior), so skip straight to processing it
+                # instead of waiting to hear the wake word again.
+                _process_voice_turn(follow_up)
+                time.sleep(0.05)
+                continue
+
+            # Idle state: wait for the wake word. Deliberately NOT holding
+            # conversation_lock here, unlike the command-capture step below -
+            # this can block indefinitely (minutes or hours between wake
+            # words), and holding a shared lock for an unbounded wait would
+            # starve /chat almost permanently. wait_for_wake_word() doesn't
+            # touch shared state or play any audio, so the only real cost of
+            # not locking it is a narrow, low-probability window where it's
+            # also listening while a /chat-triggered reply is being spoken
+            # elsewhere - accepted, since the assistant's own voice saying the
+            # actual wake word mid-reply is exceedingly unlikely.
+            try:
+                wake_word.wait_for_wake_word()
             except Exception as e:
-                print(f"[pi_server] Listening failed: {e}")
-                user_text = None
+                print(f"[pi_server] Wake-word listening failed: {e}")
+                time.sleep(1)
+                continue
 
-            if user_text:
+            # From here through the end of the turn, hold conversation_lock -
+            # same "has the mic/speaker = has the lock" reasoning as /chat,
+            # now scoped to just the active-turn window rather than the whole
+            # (now-unbounded) loop iteration.
+            with conversation_lock:
                 try:
-                    _run_turn_locked(user_text, speak_response=True)
+                    user_text = voice.listen_for_speech()
                 except Exception as e:
-                    print(f"[pi_server] Turn failed: {e}")
+                    print(f"[pi_server] Listening failed: {e}")
+                    user_text = None
 
-        time.sleep(0.05)
+                if user_text:
+                    try:
+                        _run_turn_locked(user_text, speak_response=True)
+                    except Exception as e:
+                        print(f"[pi_server] Turn failed: {e}")
+
+            time.sleep(0.05)
+    except (SystemExit, Exception) as e:
+        print(f"[pi_server] Voice loop failed to start: {e}")
 
 
 @app.post("/chat", response_model=ChatResponse)
