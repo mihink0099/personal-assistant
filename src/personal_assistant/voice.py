@@ -431,6 +431,36 @@ _SPEED_UNIT_RE = re.compile(r"\b(km/h|kph|mph)\b", re.IGNORECASE)
 _TEMPERATURE_WORDS = {"c": " degrees Celsius", "f": " degrees Fahrenheit"}
 _SPEED_WORDS = {"km/h": "kilometers per hour", "kph": "kilometers per hour", "mph": "miles per hour"}
 
+# Bare URLs read character-by-character are unusable out loud - run before
+# any other substitution touches "@"/"/" so a URL doesn't get half-mangled
+# first. Matches http(s):// links specifically (not bare domains like
+# "example.com" appearing in ordinary prose, which aren't reliably
+# distinguishable from a sentence ending in a period).
+_URL_RE = re.compile(r"https?://\S+")
+
+# espeak-ng (Piper's phonemizer) spells out any abbreviation with no
+# dictionary entry letter-by-letter - "e.g." becomes "e g", "i.e." becomes
+# "i e", instead of being read as words. Mr./Mrs./Dr. already have entries
+# in espeak-ng's own dictionary, so they're left alone.
+_EG_RE = re.compile(r"\be\.g\.", re.IGNORECASE)
+_IE_RE = re.compile(r"\bi\.e\.", re.IGNORECASE)
+
+# Emoji: espeak-ng's newer emoji support reads them as verbose literal
+# descriptions ("waving hand sign") rather than crashing, which is still
+# not something a voice assistant should be saying mid-reply - strip them
+# instead. Covers the common ranges Claude's replies actually use
+# (emoticons, symbols/pictographs, transport, dingbats, supplemental
+# symbols) plus the variation-selector/ZWJ characters emoji sequences use.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U0000FE0F"
+    "\U0000200D"
+    "]+"
+)
+
 
 def _pluralize(n: int, singular: str, plural: str) -> str:
     return singular if n == 1 else plural
@@ -458,6 +488,10 @@ def _normalize_symbols_for_speech(text: str) -> str:
     ("500 dollars"). Run after _strip_markdown_for_speech, which already
     removes **bold**/#headers/-bullets - this only handles what's left.
     """
+    text = _URL_RE.sub("a link", text)
+    text = _EMOJI_RE.sub("", text)
+    text = _EG_RE.sub("for example", text)
+    text = _IE_RE.sub("that is", text)
     text = _CURRENCY_RE.sub(_currency_to_words, text)
     text = _PERCENT_RE.sub(lambda m: f"{m.group(1)} percent", text)
     text = _TEMPERATURE_RE.sub(lambda m: _TEMPERATURE_WORDS[m.group(1).lower()], text)
@@ -465,6 +499,11 @@ def _normalize_symbols_for_speech(text: str) -> str:
     text = re.sub(r"#(\d+)", r"number \1", text)
     text = re.sub(r"\s*&\s*", " and ", text)
     text = text.replace("@", " at ")
+    text = text.replace("+", " plus ")
+    text = text.replace("=", " equals ")
+    text = text.replace("~", " about ")
+    text = text.replace("<", " less than ")
+    text = text.replace(">", " greater than ")
     text = text.replace("*", "").replace("#", "")
     # Leftover bare degree sign (no C/F immediately after, e.g. "180°
     # angle") - the temperature-specific case above already consumed the
